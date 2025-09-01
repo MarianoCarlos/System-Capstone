@@ -19,7 +19,7 @@ export default function VideoCallPage() {
 	const [liveTranslation, setLiveTranslation] = useState("");
 	const [translations, setTranslations] = useState([]);
 
-	// Initialize Socket.IO
+	// ---------------- Socket.IO Setup ----------------
 	useEffect(() => {
 		socket.current = io(SOCKET_SERVER_URL);
 
@@ -53,7 +53,6 @@ export default function VideoCallPage() {
 		});
 
 		socket.current.on("end-call", () => endCall(false));
-
 		socket.current.emit("join-room", "my-room");
 
 		return () => {
@@ -62,6 +61,7 @@ export default function VideoCallPage() {
 		};
 	}, []);
 
+	// ---------------- WebRTC Setup ----------------
 	const initializePeerConnection = () => {
 		pc.current = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
 
@@ -70,16 +70,58 @@ export default function VideoCallPage() {
 		};
 
 		pc.current.onicecandidate = (event) => {
-			if (event.candidate) {
-				if (remoteIdRef.current) {
-					socket.current.emit("ice-candidate", { candidate: event.candidate, to: remoteIdRef.current });
-				} else {
-					iceQueue.current.push(event.candidate);
-				}
+			if (!event.candidate) return;
+
+			if (remoteIdRef.current && pc.current.remoteDescription) {
+				socket.current.emit("ice-candidate", { candidate: event.candidate, to: remoteIdRef.current });
+			} else {
+				iceQueue.current.push(event.candidate);
 			}
 		};
 	};
 
+	const sendQueuedICE = async (id) => {
+		if (!pc.current || !pc.current.remoteDescription) return;
+		iceQueue.current.forEach((candidate) => socket.current.emit("ice-candidate", { candidate, to: id }));
+		iceQueue.current = [];
+	};
+
+	const createOffer = async (id) => {
+		if (!pc.current) return;
+		try {
+			const offer = await pc.current.createOffer();
+			await pc.current.setLocalDescription(offer);
+			socket.current.emit("offer", { sdp: offer, to: id });
+
+			// Small delay to ensure remote peer is ready
+			setTimeout(() => sendQueuedICE(id), 100);
+		} catch (err) {
+			console.error("Error creating offer:", err);
+		}
+	};
+
+	const handleOffer = async (sdp, from) => {
+		if (!pc.current) initializePeerConnection();
+
+		// Add local tracks only if not already added
+		const localTracks = localVideoRef.current?.srcObject?.getTracks() || [];
+		localTracks.forEach((track) => {
+			const alreadyAdded = pc.current.getSenders().some((sender) => sender.track === track);
+			if (!alreadyAdded) pc.current.addTrack(track, localVideoRef.current.srcObject);
+		});
+
+		try {
+			await pc.current.setRemoteDescription(sdp);
+			const answer = await pc.current.createAnswer();
+			await pc.current.setLocalDescription(answer);
+			socket.current.emit("answer", { sdp: answer, to: from });
+			await sendQueuedICE(from);
+		} catch (err) {
+			console.error("Error handling offer:", err);
+		}
+	};
+
+	// ---------------- Video Call Controls ----------------
 	const startVideo = async () => {
 		if (callActive) return;
 		initializePeerConnection();
@@ -100,38 +142,6 @@ export default function VideoCallPage() {
 		}
 	};
 
-	const sendQueuedICE = async (id) => {
-		iceQueue.current.forEach((candidate) => socket.current.emit("ice-candidate", { candidate, to: id }));
-		iceQueue.current = [];
-	};
-
-	const createOffer = async (id) => {
-		if (!pc.current) return;
-		try {
-			const offer = await pc.current.createOffer();
-			await pc.current.setLocalDescription(offer);
-			socket.current.emit("offer", { sdp: offer, to: id });
-		} catch (err) {
-			console.error("Error creating offer:", err);
-		}
-	};
-
-	const handleOffer = async (sdp, from) => {
-		if (!pc.current) initializePeerConnection();
-		if (localVideoRef.current?.srcObject) {
-			const tracks = localVideoRef.current.srcObject.getTracks();
-			tracks.forEach((track) => pc.current.addTrack(track, localVideoRef.current.srcObject));
-		}
-		try {
-			await pc.current.setRemoteDescription(sdp);
-			const answer = await pc.current.createAnswer();
-			await pc.current.setLocalDescription(answer);
-			socket.current.emit("answer", { sdp: answer, to: from });
-		} catch (err) {
-			console.error("Error handling offer:", err);
-		}
-	};
-
 	const endCall = (notifyRemote = true) => {
 		if (!callActive) return;
 
@@ -145,7 +155,6 @@ export default function VideoCallPage() {
 
 		pc.current?.close();
 		pc.current = null;
-
 		remoteIdRef.current = null;
 		setLiveTranslation("");
 		setCallActive(false);
@@ -177,6 +186,7 @@ export default function VideoCallPage() {
 		);
 	};
 
+	// ---------------- JSX ----------------
 	return (
 		<div className="flex h-screen bg-gray-100 text-gray-900">
 			{/* Main Video Area */}
@@ -286,6 +296,7 @@ export default function VideoCallPage() {
 							item.sender === "local"
 								? "self-end bg-blue-100 text-right"
 								: "self-start bg-green-100 text-left";
+
 						return (
 							<div key={i} className={`p-3 rounded-lg shadow-sm max-w-[85%] ${alignment}`}>
 								<p className="font-medium">{textToShow}</p>
