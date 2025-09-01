@@ -13,70 +13,46 @@ export default function VideoCallPage() {
 	const iceQueue = useRef([]);
 	const remoteIdRef = useRef(null);
 
-	const [remoteId, setRemoteId] = useState(null);
 	const [isMuted, setIsMuted] = useState(false);
 	const [cameraOn, setCameraOn] = useState(true);
 	const [callActive, setCallActive] = useState(false);
 	const [liveTranslation, setLiveTranslation] = useState("");
-	const [translations, setTranslations] = useState([
-		{
-			sender: "local",
-			textEn: "Hello, how are you?",
-			textFil: "Kamusta, kumusta ka?",
-			accuracy: "98%",
-			timestamp: "10:32 AM",
-			showLang: "En",
-		},
-		{
-			sender: "remote",
-			textEn: "I am fine, thank you!",
-			textFil: "Ayos lang ako, salamat!",
-			accuracy: "97%",
-			timestamp: "10:33 AM",
-			showLang: "En",
-		},
-	]);
+	const [translations, setTranslations] = useState([]);
 
 	// Initialize Socket.IO
 	useEffect(() => {
 		socket.current = io(SOCKET_SERVER_URL);
 
 		socket.current.on("new-user", async (id) => {
-			setRemoteId(id);
 			remoteIdRef.current = id;
-
-			iceQueue.current.forEach((candidate) => socket.current.emit("ice-candidate", { candidate, to: id }));
-			iceQueue.current = [];
-
-			// Create offer if local stream exists
-			if (localVideoRef.current?.srcObject) {
-				const offer = await pc.current.createOffer();
-				await pc.current.setLocalDescription(offer);
-				socket.current.emit("offer", { sdp: offer, to: id });
-			}
+			await sendQueuedICE(id);
+			if (localVideoRef.current?.srcObject) await createOffer(id);
 		});
 
 		socket.current.on("offer", async (data) => {
-			setRemoteId(data.from);
 			remoteIdRef.current = data.from;
-			await pc.current.setRemoteDescription(data.sdp);
-			const answer = await pc.current.createAnswer();
-			await pc.current.setLocalDescription(answer);
-			socket.current.emit("answer", { sdp: answer, to: data.from });
+			await handleOffer(data.sdp, data.from);
 		});
 
 		socket.current.on("answer", async (data) => {
-			await pc.current.setRemoteDescription(data.sdp);
+			try {
+				await pc.current?.setRemoteDescription(data.sdp);
+			} catch (err) {
+				console.error("Error setting remote description (answer):", err);
+			}
 		});
 
 		socket.current.on("ice-candidate", async ({ candidate }) => {
-			if (!candidate) return;
-			await pc.current.addIceCandidate(candidate);
+			if (candidate) {
+				try {
+					await pc.current?.addIceCandidate(candidate);
+				} catch (err) {
+					console.error("Error adding ICE candidate:", err);
+				}
+			}
 		});
 
-		socket.current.on("end-call", () => {
-			endCall(false); // Remote ended call
-		});
+		socket.current.on("end-call", () => endCall(false));
 
 		socket.current.emit("join-room", "my-room");
 
@@ -86,8 +62,7 @@ export default function VideoCallPage() {
 		};
 	}, []);
 
-	// Initialize PeerConnection
-	const initPeerConnection = () => {
+	const initializePeerConnection = () => {
 		pc.current = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
 
 		pc.current.ontrack = (event) => {
@@ -95,28 +70,29 @@ export default function VideoCallPage() {
 		};
 
 		pc.current.onicecandidate = (event) => {
-			if (event.candidate && remoteIdRef.current) {
-				socket.current.emit("ice-candidate", { candidate: event.candidate, to: remoteIdRef.current });
-			} else if (event.candidate) {
-				iceQueue.current.push(event.candidate);
+			if (event.candidate) {
+				if (remoteIdRef.current) {
+					socket.current.emit("ice-candidate", { candidate: event.candidate, to: remoteIdRef.current });
+				} else {
+					iceQueue.current.push(event.candidate);
+				}
 			}
 		};
 	};
 
-	// Start Call
 	const startVideo = async () => {
+		if (callActive) return;
+		initializePeerConnection();
+
 		if (!navigator.mediaDevices?.getUserMedia) {
-			alert("Camera/microphone not supported.");
+			alert("Camera/microphone not supported. Use Chrome, Edge, or Safari over HTTPS.");
 			return;
 		}
-
-		initPeerConnection();
 
 		try {
 			const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
 			if (localVideoRef.current) localVideoRef.current.srcObject = stream;
 			stream.getTracks().forEach((track) => pc.current.addTrack(track, stream));
-
 			setCallActive(true);
 		} catch (err) {
 			console.error("Cannot access camera/microphone:", err);
@@ -124,26 +100,55 @@ export default function VideoCallPage() {
 		}
 	};
 
-	// End Call
-	const endCall = (notifyRemote = true) => {
-		if (notifyRemote && remoteIdRef.current) {
-			socket.current.emit("end-call", { to: remoteIdRef.current });
+	const sendQueuedICE = async (id) => {
+		iceQueue.current.forEach((candidate) => socket.current.emit("ice-candidate", { candidate, to: id }));
+		iceQueue.current = [];
+	};
+
+	const createOffer = async (id) => {
+		if (!pc.current) return;
+		try {
+			const offer = await pc.current.createOffer();
+			await pc.current.setLocalDescription(offer);
+			socket.current.emit("offer", { sdp: offer, to: id });
+		} catch (err) {
+			console.error("Error creating offer:", err);
 		}
+	};
 
-		setCallActive(false);
-		setRemoteId(null);
-		remoteIdRef.current = null;
+	const handleOffer = async (sdp, from) => {
+		if (!pc.current) initializePeerConnection();
+		if (localVideoRef.current?.srcObject) {
+			const tracks = localVideoRef.current.srcObject.getTracks();
+			tracks.forEach((track) => pc.current.addTrack(track, localVideoRef.current.srcObject));
+		}
+		try {
+			await pc.current.setRemoteDescription(sdp);
+			const answer = await pc.current.createAnswer();
+			await pc.current.setLocalDescription(answer);
+			socket.current.emit("answer", { sdp: answer, to: from });
+		} catch (err) {
+			console.error("Error handling offer:", err);
+		}
+	};
 
-		// Close existing PC
-		pc.current?.close();
+	const endCall = (notifyRemote = true) => {
+		if (!callActive) return;
 
-		// Stop local stream
+		if (notifyRemote && remoteIdRef.current) socket.current.emit("end-call", { to: remoteIdRef.current });
+
 		localVideoRef.current?.srcObject?.getTracks().forEach((track) => track.stop());
 		localVideoRef.current.srcObject = null;
 
-		// Stop remote stream
 		remoteVideoRef.current?.srcObject?.getTracks().forEach((track) => track.stop());
 		remoteVideoRef.current.srcObject = null;
+
+		pc.current?.close();
+		pc.current = null;
+
+		remoteIdRef.current = null;
+		setLiveTranslation("");
+		setCallActive(false);
 	};
 
 	const toggleMute = () => {
@@ -165,6 +170,7 @@ export default function VideoCallPage() {
 		utterance.lang = lang === "Filipino" ? "fil-PH" : "en-US";
 		speechSynthesis.speak(utterance);
 	};
+
 	const toggleChatLang = (index) => {
 		setTranslations((prev) =>
 			prev.map((item, i) => (i === index ? { ...item, showLang: item.showLang === "En" ? "Fil" : "En" } : item))
@@ -173,6 +179,7 @@ export default function VideoCallPage() {
 
 	return (
 		<div className="flex h-screen bg-gray-100 text-gray-900">
+			{/* Main Video Area */}
 			<main className="flex-1 flex flex-col items-center justify-center p-6 gap-6">
 				<div className="flex gap-6 w-full justify-center flex-wrap relative">
 					{/* Local Video */}
@@ -233,6 +240,7 @@ export default function VideoCallPage() {
 					>
 						{cameraOn ? <FaVideo /> : <FaVideoSlash />} <span>{cameraOn ? "Camera On" : "Camera Off"}</span>
 					</button>
+
 					{!callActive ? (
 						<button
 							onClick={startVideo}
