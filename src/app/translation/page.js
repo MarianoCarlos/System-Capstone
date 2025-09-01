@@ -3,13 +3,16 @@ import { useRef, useState, useEffect } from "react";
 import io from "socket.io-client";
 import { FaMicrophone, FaMicrophoneSlash, FaVideo, FaVideoSlash, FaPhone } from "react-icons/fa";
 
-const SOCKET_SERVER_URL = "http://localhost:3001"; // Update for HTTPS in production
+const SOCKET_SERVER_URL = "https://backend-capstone-l19p.onrender.com"; // Replace with your server IP or domain
 
 export default function VideoCallPage() {
 	const localVideoRef = useRef(null);
 	const remoteVideoRef = useRef(null);
 	const pc = useRef(null);
 	const socket = useRef(null);
+	const iceQueue = useRef([]);
+	const remoteIdRef = useRef(null);
+
 	const [remoteId, setRemoteId] = useState(null);
 	const [isMuted, setIsMuted] = useState(false);
 	const [cameraOn, setCameraOn] = useState(true);
@@ -33,71 +36,100 @@ export default function VideoCallPage() {
 		},
 	]);
 
-	const iceQueue = useRef([]); // Queue ICE candidates until remoteId exists
-
 	useEffect(() => {
 		// Initialize Socket.IO
 		socket.current = io(SOCKET_SERVER_URL);
 
 		// Initialize PeerConnection
-		pc.current = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+		pc.current = new RTCPeerConnection({
+			iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+		});
 
+		// Handle remote stream
 		pc.current.ontrack = (event) => {
-			if (remoteVideoRef.current) remoteVideoRef.current.srcObject = event.streams[0];
+			if (remoteVideoRef.current) {
+				remoteVideoRef.current.srcObject = event.streams[0];
+			}
 		};
 
+		// ICE candidates
 		pc.current.onicecandidate = (event) => {
 			if (event.candidate) {
-				if (remoteId) {
-					socket.current.emit("ice-candidate", { candidate: event.candidate, to: remoteId });
+				if (remoteIdRef.current) {
+					socket.current.emit("ice-candidate", { candidate: event.candidate, to: remoteIdRef.current });
 				} else {
-					iceQueue.current.push(event.candidate); // Queue until remoteId exists
+					iceQueue.current.push(event.candidate);
 				}
 			}
 		};
 
+		// New user joined
 		socket.current.on("new-user", async (id) => {
+			console.log("Discovered new user:", id);
 			setRemoteId(id);
+			remoteIdRef.current = id;
+
 			// Send queued ICE candidates
-			iceQueue.current.forEach((candidate) => {
-				socket.current.emit("ice-candidate", { candidate, to: id });
-			});
+			iceQueue.current.forEach((candidate) => socket.current.emit("ice-candidate", { candidate, to: id }));
 			iceQueue.current = [];
 
+			// Create offer if local video exists
 			if (localVideoRef.current?.srcObject) {
-				const offer = await pc.current.createOffer();
-				await pc.current.setLocalDescription(offer);
-				socket.current.emit("offer", { sdp: offer, to: id });
+				try {
+					const offer = await pc.current.createOffer();
+					await pc.current.setLocalDescription(offer);
+					socket.current.emit("offer", { sdp: offer, to: id });
+				} catch (err) {
+					console.error("Error creating offer:", err);
+				}
 			}
 		});
 
+		// Receive offer
 		socket.current.on("offer", async (data) => {
 			setRemoteId(data.from);
-			await pc.current.setRemoteDescription(data.sdp);
-			const answer = await pc.current.createAnswer();
-			await pc.current.setLocalDescription(answer);
-			socket.current.emit("answer", { sdp: answer, to: data.from });
-		});
+			remoteIdRef.current = data.from;
 
-		socket.current.on("answer", async (data) => {
-			await pc.current.setRemoteDescription(data.sdp);
-		});
-
-		socket.current.on("ice-candidate", async ({ candidate }) => {
 			try {
-				if (candidate) await pc.current.addIceCandidate(candidate);
+				await pc.current.setRemoteDescription(data.sdp);
+				const answer = await pc.current.createAnswer();
+				await pc.current.setLocalDescription(answer);
+				socket.current.emit("answer", { sdp: answer, to: data.from });
+			} catch (err) {
+				console.error("Error handling offer:", err);
+			}
+		});
+
+		// Receive answer
+		socket.current.on("answer", async (data) => {
+			try {
+				await pc.current.setRemoteDescription(data.sdp);
+			} catch (err) {
+				console.error("Error setting remote description (answer):", err);
+			}
+		});
+
+		// Receive ICE candidates
+		socket.current.on("ice-candidate", async ({ candidate }) => {
+			if (!candidate) return;
+			try {
+				await pc.current.addIceCandidate(candidate);
 			} catch (err) {
 				console.error("Error adding ICE candidate:", err);
 			}
 		});
 
+		// Join room
 		socket.current.emit("join-room", "my-room");
 
 		return () => {
+			// Cleanup
 			socket.current.disconnect();
 			pc.current.close();
+			localVideoRef.current?.srcObject?.getTracks().forEach((track) => track.stop());
+			remoteVideoRef.current?.srcObject?.getTracks().forEach((track) => track.stop());
 		};
-	}, [remoteId]);
+	}, []);
 
 	const startVideo = async () => {
 		if (!navigator.mediaDevices?.getUserMedia) {
@@ -110,12 +142,7 @@ export default function VideoCallPage() {
 			if (localVideoRef.current) localVideoRef.current.srcObject = stream;
 			stream.getTracks().forEach((track) => pc.current.addTrack(track, stream));
 
-			// If remote already exists, create offer
-			if (remoteId) {
-				const offer = await pc.current.createOffer();
-				await pc.current.setLocalDescription(offer);
-				socket.current.emit("offer", { sdp: offer, to: remoteId });
-			}
+			// Offer is only sent via 'new-user' event to avoid duplicates
 		} catch (err) {
 			console.error("Error accessing camera/microphone:", err);
 			alert("Cannot access camera/microphone. Please allow permissions and use HTTPS.");
@@ -136,6 +163,7 @@ export default function VideoCallPage() {
 
 	const copyText = (text) => navigator.clipboard.writeText(text);
 	const speakText = (text, lang) => {
+		speechSynthesis.cancel(); // Cancel any ongoing speech
 		const utterance = new SpeechSynthesisUtterance(text);
 		utterance.lang = lang === "Filipino" ? "fil-PH" : "en-US";
 		speechSynthesis.speak(utterance);
