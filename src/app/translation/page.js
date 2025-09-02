@@ -4,7 +4,6 @@ import io from "socket.io-client";
 import { FaMicrophone, FaMicrophoneSlash, FaVideo, FaVideoSlash, FaPhone, FaPhoneSlash } from "react-icons/fa";
 
 const SOCKET_SERVER_URL = "https://backend-capstone-l19p.onrender.com";
-const ASL_BACKEND_URL = "https://backend-web-service-5f90.onrender.com/predict";
 
 export default function VideoCallPage() {
 	const localVideoRef = useRef(null);
@@ -17,53 +16,45 @@ export default function VideoCallPage() {
 	const [isMuted, setIsMuted] = useState(false);
 	const [cameraOn, setCameraOn] = useState(true);
 	const [callActive, setCallActive] = useState(false);
-
-	const [liveTranslationLocal, setLiveTranslationLocal] = useState("");
-	const [liveTranslationRemote, setLiveTranslationRemote] = useState("");
+	const [liveTranslation, setLiveTranslation] = useState("");
 	const [translations, setTranslations] = useState([]);
 
-	// ---------------- Socket.IO ----------------
+	// Initialize Socket.IO
 	useEffect(() => {
 		socket.current = io(SOCKET_SERVER_URL);
 
-		socket.current.on("connect", () => {
-			console.log("Connected to Socket.IO:", socket.current.id);
-			socket.current.emit("join-room", "my-room"); // you can make this dynamic
-		});
-
-		socket.current.on("new-user", (id) => {
+		socket.current.on("new-user", async (id) => {
 			remoteIdRef.current = id;
-			if (!pc.current) initializePeerConnection();
-			if (localVideoRef.current?.srcObject) addLocalTracks();
-
-			// Flush queued ICE candidates
-			iceQueue.current.forEach((candidate) => socket.current.emit("ice-candidate", { candidate, to: id }));
-			iceQueue.current = [];
+			await sendQueuedICE(id);
+			if (localVideoRef.current?.srcObject) await createOffer(id);
 		});
 
-		socket.current.on("offer", async ({ sdp, from }) => {
-			remoteIdRef.current = from;
-			await handleOffer(new RTCSessionDescription(sdp), from);
+		socket.current.on("offer", async (data) => {
+			remoteIdRef.current = data.from;
+			await handleOffer(data.sdp, data.from);
 		});
 
-		socket.current.on("answer", async ({ sdp }) => {
-			if (pc.current) await pc.current.setRemoteDescription(new RTCSessionDescription(sdp));
+		socket.current.on("answer", async (data) => {
+			try {
+				await pc.current?.setRemoteDescription(data.sdp);
+			} catch (err) {
+				console.error("Error setting remote description (answer):", err);
+			}
 		});
 
 		socket.current.on("ice-candidate", async ({ candidate }) => {
-			if (!candidate) return;
-			if (pc.current) {
+			if (candidate) {
 				try {
-					await pc.current.addIceCandidate(new RTCIceCandidate(candidate));
+					await pc.current?.addIceCandidate(candidate);
 				} catch (err) {
 					console.error("Error adding ICE candidate:", err);
 				}
-			} else {
-				iceQueue.current.push(candidate);
 			}
 		});
 
 		socket.current.on("end-call", () => endCall(false));
+
+		socket.current.emit("join-room", "my-room");
 
 		return () => {
 			endCall(false);
@@ -71,49 +62,66 @@ export default function VideoCallPage() {
 		};
 	}, []);
 
-	// ---------------- WebRTC ----------------
 	const initializePeerConnection = () => {
-		pc.current = new RTCPeerConnection({
-			iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-		});
+		pc.current = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
 
 		pc.current.ontrack = (event) => {
 			if (remoteVideoRef.current) remoteVideoRef.current.srcObject = event.streams[0];
 		};
 
 		pc.current.onicecandidate = (event) => {
-			if (!event.candidate) return;
-			if (remoteIdRef.current) {
-				socket.current.emit("ice-candidate", { candidate: event.candidate, to: remoteIdRef.current });
-			} else {
-				iceQueue.current.push(event.candidate);
-			}
-		};
-
-		pc.current.onnegotiationneeded = async () => {
-			if (!remoteIdRef.current) return;
-			try {
-				const offer = await pc.current.createOffer();
-				await pc.current.setLocalDescription(offer);
-				socket.current.emit("offer", { sdp: offer, to: remoteIdRef.current });
-			} catch (err) {
-				console.error("Negotiation error:", err);
+			if (event.candidate) {
+				if (remoteIdRef.current) {
+					socket.current.emit("ice-candidate", { candidate: event.candidate, to: remoteIdRef.current });
+				} else {
+					iceQueue.current.push(event.candidate);
+				}
 			}
 		};
 	};
 
-	const addLocalTracks = () => {
-		if (!pc.current || !localVideoRef.current?.srcObject) return;
-		localVideoRef.current.srcObject.getTracks().forEach((track) => {
-			if (!pc.current.getSenders().some((s) => s.track === track)) {
-				pc.current.addTrack(track, localVideoRef.current.srcObject);
-			}
-		});
+	const startVideo = async () => {
+		if (callActive) return;
+		initializePeerConnection();
+
+		if (!navigator.mediaDevices?.getUserMedia) {
+			alert("Camera/microphone not supported. Use Chrome, Edge, or Safari over HTTPS.");
+			return;
+		}
+
+		try {
+			const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+			if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+			stream.getTracks().forEach((track) => pc.current.addTrack(track, stream));
+			setCallActive(true);
+		} catch (err) {
+			console.error("Cannot access camera/microphone:", err);
+			alert("Please allow camera/microphone permissions.");
+		}
+	};
+
+	const sendQueuedICE = async (id) => {
+		iceQueue.current.forEach((candidate) => socket.current.emit("ice-candidate", { candidate, to: id }));
+		iceQueue.current = [];
+	};
+
+	const createOffer = async (id) => {
+		if (!pc.current) return;
+		try {
+			const offer = await pc.current.createOffer();
+			await pc.current.setLocalDescription(offer);
+			socket.current.emit("offer", { sdp: offer, to: id });
+		} catch (err) {
+			console.error("Error creating offer:", err);
+		}
 	};
 
 	const handleOffer = async (sdp, from) => {
 		if (!pc.current) initializePeerConnection();
-		addLocalTracks();
+		if (localVideoRef.current?.srcObject) {
+			const tracks = localVideoRef.current.srcObject.getTracks();
+			tracks.forEach((track) => pc.current.addTrack(track, localVideoRef.current.srcObject));
+		}
 		try {
 			await pc.current.setRemoteDescription(sdp);
 			const answer = await pc.current.createAnswer();
@@ -124,110 +132,44 @@ export default function VideoCallPage() {
 		}
 	};
 
-	// ---------------- Video Controls ----------------
-	const startVideo = async () => {
-		if (callActive) return;
-		if (!navigator.mediaDevices?.getUserMedia) {
-			alert("Camera/microphone not supported.");
-			return;
-		}
-		try {
-			const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-			localVideoRef.current.srcObject = stream;
-			if (!pc.current) initializePeerConnection();
-			addLocalTracks();
-			setCallActive(true);
-		} catch (err) {
-			console.error("Cannot access camera/microphone:", err);
-			alert("Allow camera/microphone permissions.");
-		}
-	};
-
 	const endCall = (notifyRemote = true) => {
 		if (!callActive) return;
+
 		if (notifyRemote && remoteIdRef.current) socket.current.emit("end-call", { to: remoteIdRef.current });
 
-		localVideoRef.current?.srcObject?.getTracks().forEach((t) => t.stop());
+		localVideoRef.current?.srcObject?.getTracks().forEach((track) => track.stop());
 		localVideoRef.current.srcObject = null;
-		remoteVideoRef.current?.srcObject?.getTracks().forEach((t) => t.stop());
+
+		remoteVideoRef.current?.srcObject?.getTracks().forEach((track) => track.stop());
 		remoteVideoRef.current.srcObject = null;
 
 		pc.current?.close();
 		pc.current = null;
-		remoteIdRef.current = null;
 
-		setLiveTranslationLocal("");
-		setLiveTranslationRemote("");
+		remoteIdRef.current = null;
+		setLiveTranslation("");
 		setCallActive(false);
 	};
 
 	const toggleMute = () => {
-		setIsMuted((prev) => {
-			localVideoRef.current?.srcObject?.getAudioTracks().forEach((t) => (t.enabled = !prev));
-			return !prev;
-		});
+		const newMuted = !isMuted;
+		localVideoRef.current?.srcObject?.getAudioTracks().forEach((track) => (track.enabled = !newMuted));
+		setIsMuted(newMuted);
 	};
 
 	const toggleCamera = () => {
-		setCameraOn((prev) => {
-			localVideoRef.current?.srcObject?.getVideoTracks().forEach((t) => (t.enabled = !prev));
-			return !prev;
-		});
+		const newCameraOn = !cameraOn;
+		localVideoRef.current?.srcObject?.getVideoTracks().forEach((track) => (track.enabled = newCameraOn));
+		setCameraOn(newCameraOn);
 	};
 
-	// ---------------- ASL Translation ----------------
-	const captureFrameBlob = (videoRef, scale = 1) => {
-		if (!videoRef.current || videoRef.current.readyState < 2) return null;
-		const video = videoRef.current;
-		const canvas = document.createElement("canvas");
-		canvas.width = video.videoWidth * scale;
-		canvas.height = video.videoHeight * scale;
-		canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
-		return new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), "image/jpeg", 0.8));
+	const copyText = (text) => navigator.clipboard.writeText(text);
+	const speakText = (text, lang) => {
+		speechSynthesis.cancel();
+		const utterance = new SpeechSynthesisUtterance(text);
+		utterance.lang = lang === "Filipino" ? "fil-PH" : "en-US";
+		speechSynthesis.speak(utterance);
 	};
-
-	const sendFrameToBackend = async (videoRef, setTranslation, sender = "local") => {
-		const blob = await captureFrameBlob(videoRef, sender === "remote" ? 0.3 : 1);
-		if (!blob) return;
-		const formData = new FormData();
-		formData.append("file", blob, "frame.jpg");
-
-		try {
-			const res = await fetch(ASL_BACKEND_URL, { method: "POST", body: formData });
-			const data = await res.json();
-			if (data.prediction) {
-				setTranslation(data.prediction);
-				setTranslations((prev) => [
-					...prev.slice(-49),
-					{
-						textEn: data.prediction,
-						textFil: data.prediction,
-						timestamp: new Date().toLocaleTimeString(),
-						sender,
-						showLang: "En",
-						accuracy: "N/A",
-					},
-				]);
-			}
-		} catch (err) {
-			console.error(`${sender} ASL prediction error:`, err);
-		}
-	};
-
-	useEffect(() => {
-		let localInterval, remoteInterval;
-		if (callActive) {
-			localInterval = setInterval(() => sendFrameToBackend(localVideoRef, setLiveTranslationLocal, "local"), 500);
-			remoteInterval = setInterval(
-				() => sendFrameToBackend(remoteVideoRef, setLiveTranslationRemote, "remote"),
-				1000
-			);
-		}
-		return () => {
-			clearInterval(localInterval);
-			clearInterval(remoteInterval);
-		};
-	}, [callActive]);
 
 	const toggleChatLang = (index) => {
 		setTranslations((prev) =>
@@ -235,19 +177,10 @@ export default function VideoCallPage() {
 		);
 	};
 
-	const copyText = (text) => navigator.clipboard.writeText(text);
-	const speakText = (text, lang) => {
-		speechSynthesis.cancel();
-		const u = new SpeechSynthesisUtterance(text);
-		u.lang = lang === "Filipino" ? "fil-PH" : "en-US";
-		speechSynthesis.speak(u);
-	};
-
-	// ---------------- JSX ----------------
 	return (
 		<div className="flex h-screen bg-gray-100 text-gray-900">
+			{/* Main Video Area */}
 			<main className="flex-1 flex flex-col items-center justify-center p-6 gap-6">
-				{/* Video section */}
 				<div className="flex gap-6 w-full justify-center flex-wrap relative">
 					{/* Local Video */}
 					<div className="relative">
@@ -293,48 +226,51 @@ export default function VideoCallPage() {
 				<div className="flex gap-6">
 					<button
 						onClick={toggleMute}
-						className={`flex items-center gap-2 px-5 py-3 rounded-full ${
+						className={`flex items-center gap-2 px-5 py-3 rounded-full shadow-lg text-white transition-transform hover:scale-105 ${
 							isMuted ? "bg-gray-500" : "bg-red-500"
-						} text-white`}
+						}`}
 					>
-						{isMuted ? <FaMicrophoneSlash /> : <FaMicrophone />} {isMuted ? "Unmute" : "Mute"}
+						{isMuted ? <FaMicrophoneSlash /> : <FaMicrophone />} <span>{isMuted ? "Unmute" : "Mute"}</span>
 					</button>
 					<button
 						onClick={toggleCamera}
-						className={`flex items-center gap-2 px-5 py-3 rounded-full ${
+						className={`flex items-center gap-2 px-5 py-3 rounded-full shadow-lg text-white transition-transform hover:scale-105 ${
 							cameraOn ? "bg-blue-500" : "bg-gray-500"
-						} text-white`}
+						}`}
 					>
-						{cameraOn ? <FaVideo /> : <FaVideoSlash />} {cameraOn ? "Camera On" : "Camera Off"}
+						{cameraOn ? <FaVideo /> : <FaVideoSlash />} <span>{cameraOn ? "Camera On" : "Camera Off"}</span>
 					</button>
+
 					{!callActive ? (
 						<button
 							onClick={startVideo}
-							className="flex items-center gap-2 px-5 py-3 rounded-full bg-green-500 text-white"
+							className="flex items-center gap-2 px-5 py-3 rounded-full bg-green-500 shadow-lg text-white transition-transform hover:scale-105"
 						>
-							<FaPhone /> Start Call
+							<FaPhone /> <span>Start Call</span>
 						</button>
 					) : (
 						<button
 							onClick={() => endCall()}
-							className="flex items-center gap-2 px-5 py-3 rounded-full bg-red-600 text-white"
+							className="flex items-center gap-2 px-5 py-3 rounded-full bg-red-600 shadow-lg text-white transition-transform hover:scale-105"
 						>
-							<FaPhoneSlash /> End Call
+							<FaPhoneSlash /> <span>End Call</span>
 						</button>
 					)}
 				</div>
 
-				{/* Live Translations */}
-				<div className="w-full max-w-4xl bg-white rounded-xl shadow p-4 mt-4">
-					<h3 className="text-md font-semibold">Your Translation</h3>
-					<div className="h-24 bg-gray-50 p-3 rounded-md border overflow-y-auto">
-						<p className="text-gray-700">{liveTranslationLocal || "Your signing translation..."}</p>
+				{/* Live Translation */}
+				<div className="w-full max-w-4xl bg-white rounded-xl shadow p-4">
+					<div className="flex justify-between items-center mb-2">
+						<h3 className="text-md font-semibold">Live Translation</h3>
+						<button
+							onClick={() => setLiveTranslation("")}
+							className="px-3 py-1 text-xs bg-red-500 text-white rounded shadow hover:bg-red-600"
+						>
+							Clear
+						</button>
 					</div>
-				</div>
-				<div className="w-full max-w-4xl bg-white rounded-xl shadow p-4 mt-4">
-					<h3 className="text-md font-semibold">Remote Translation</h3>
-					<div className="h-24 bg-gray-50 p-3 rounded-md border overflow-y-auto">
-						<p className="text-gray-700">{liveTranslationRemote || "Remote signing translation..."}</p>
+					<div className="h-28 bg-gray-50 p-3 rounded-md border overflow-y-auto">
+						<p className="text-gray-700">{liveTranslation || "Ongoing translation appears here..."}</p>
 					</div>
 				</div>
 			</main>
@@ -344,14 +280,15 @@ export default function VideoCallPage() {
 				<h2 className="text-lg font-semibold mb-4">Translation History</h2>
 				<div className="flex flex-col gap-3">
 					{translations.map((item, i) => {
-						const text = item.showLang === "En" ? item.textEn : item.textFil;
+						const textToShow = item.showLang === "En" ? item.textEn : item.textFil;
+						const langLabel = item.showLang === "En" ? "English" : "Filipino";
 						const alignment =
 							item.sender === "local"
 								? "self-end bg-blue-100 text-right"
 								: "self-start bg-green-100 text-left";
 						return (
 							<div key={i} className={`p-3 rounded-lg shadow-sm max-w-[85%] ${alignment}`}>
-								<p className="font-medium">{text}</p>
+								<p className="font-medium">{textToShow}</p>
 								<p className="text-xs text-gray-600">{item.timestamp}</p>
 								<p className="text-xs text-green-700">Accuracy: {item.accuracy}</p>
 								<div className="flex gap-2 mt-2 justify-end">
@@ -359,16 +296,16 @@ export default function VideoCallPage() {
 										onClick={() => toggleChatLang(i)}
 										className="px-2 py-1 text-xs bg-yellow-500 text-white rounded"
 									>
-										{item.showLang === "En" ? "Filipino" : "English"}
+										{langLabel} ↔ {item.showLang === "En" ? "Filipino" : "English"}
 									</button>
 									<button
-										onClick={() => copyText(text)}
+										onClick={() => copyText(textToShow)}
 										className="px-2 py-1 text-xs bg-blue-500 text-white rounded"
 									>
 										Copy
 									</button>
 									<button
-										onClick={() => speakText(text, item.showLang === "En" ? "English" : "Filipino")}
+										onClick={() => speakText(textToShow, langLabel)}
 										className="px-2 py-1 text-xs bg-gray-700 text-white rounded"
 									>
 										Speak
