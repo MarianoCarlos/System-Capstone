@@ -22,33 +22,35 @@ export default function VideoCallPage() {
 	const [liveTranslationRemote, setLiveTranslationRemote] = useState("");
 	const [translations, setTranslations] = useState([]);
 
-	// ---------------- Socket.IO Setup ----------------
+	// ---------------- Socket.IO ----------------
 	useEffect(() => {
 		socket.current = io(SOCKET_SERVER_URL);
 
+		socket.current.on("connect", () => socket.current.emit("join-room", "my-room"));
+
 		socket.current.on("new-user", async (id) => {
 			remoteIdRef.current = id;
-			await sendQueuedICE(id);
-			if (localVideoRef.current?.srcObject) await createOffer(id);
+			if (!pc.current) initializePeerConnection();
+			addLocalTracks();
+			await createOffer(id);
+			flushICEQueue(id);
 		});
 
-		socket.current.on("offer", async (data) => {
-			remoteIdRef.current = data.from;
-			await handleOffer(data.sdp, data.from);
+		socket.current.on("offer", async ({ sdp, from }) => {
+			remoteIdRef.current = from;
+			if (!pc.current) initializePeerConnection();
+			addLocalTracks();
+			await handleOffer(sdp, from);
 		});
 
-		socket.current.on("answer", async (data) => {
-			try {
-				await pc.current?.setRemoteDescription(data.sdp);
-			} catch (err) {
-				console.error("Error setting remote description (answer):", err);
-			}
+		socket.current.on("answer", async ({ sdp }) => {
+			if (pc.current) await pc.current.setRemoteDescription(sdp);
 		});
 
 		socket.current.on("ice-candidate", async ({ candidate }) => {
-			if (candidate) {
+			if (candidate && pc.current) {
 				try {
-					await pc.current?.addIceCandidate(candidate);
+					await pc.current.addIceCandidate(candidate);
 				} catch (err) {
 					console.error("Error adding ICE candidate:", err);
 				}
@@ -56,7 +58,6 @@ export default function VideoCallPage() {
 		});
 
 		socket.current.on("end-call", () => endCall(false));
-		socket.current.emit("join-room", "my-room");
 
 		return () => {
 			endCall(false);
@@ -64,7 +65,7 @@ export default function VideoCallPage() {
 		};
 	}, []);
 
-	// ---------------- WebRTC Setup ----------------
+	// ---------------- WebRTC ----------------
 	const initializePeerConnection = () => {
 		pc.current = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
 
@@ -73,19 +74,28 @@ export default function VideoCallPage() {
 		};
 
 		pc.current.onicecandidate = (event) => {
-			if (!event.candidate) return;
-			if (remoteIdRef.current && pc.current.remoteDescription) {
-				socket.current.emit("ice-candidate", { candidate: event.candidate, to: remoteIdRef.current });
-			} else {
-				iceQueue.current.push(event.candidate);
+			if (event.candidate) {
+				if (remoteIdRef.current) {
+					socket.current.emit("ice-candidate", { candidate: event.candidate, to: remoteIdRef.current });
+				} else {
+					iceQueue.current.push(event.candidate);
+				}
 			}
 		};
 	};
 
-	const sendQueuedICE = async (id) => {
-		if (!pc.current || !pc.current.remoteDescription) return;
+	const flushICEQueue = (id) => {
 		iceQueue.current.forEach((candidate) => socket.current.emit("ice-candidate", { candidate, to: id }));
 		iceQueue.current = [];
+	};
+
+	const addLocalTracks = () => {
+		if (!pc.current || !localVideoRef.current?.srcObject) return;
+		localVideoRef.current.srcObject.getTracks().forEach((track) => {
+			if (!pc.current.getSenders().some((s) => s.track === track)) {
+				pc.current.addTrack(track, localVideoRef.current.srcObject);
+			}
+		});
 	};
 
 	const createOffer = async (id) => {
@@ -94,7 +104,6 @@ export default function VideoCallPage() {
 			const offer = await pc.current.createOffer();
 			await pc.current.setLocalDescription(offer);
 			socket.current.emit("offer", { sdp: offer, to: id });
-			setTimeout(() => sendQueuedICE(id), 100);
 		} catch (err) {
 			console.error("Error creating offer:", err);
 		}
@@ -102,41 +111,33 @@ export default function VideoCallPage() {
 
 	const handleOffer = async (sdp, from) => {
 		if (!pc.current) initializePeerConnection();
-		const localTracks = localVideoRef.current?.srcObject?.getTracks() || [];
-		localTracks.forEach((track) => {
-			const alreadyAdded = pc.current.getSenders().some((sender) => sender.track === track);
-			if (!alreadyAdded) pc.current.addTrack(track, localVideoRef.current.srcObject);
-		});
-
+		addLocalTracks();
 		try {
 			await pc.current.setRemoteDescription(sdp);
 			const answer = await pc.current.createAnswer();
 			await pc.current.setLocalDescription(answer);
 			socket.current.emit("answer", { sdp: answer, to: from });
-			await sendQueuedICE(from);
 		} catch (err) {
 			console.error("Error handling offer:", err);
 		}
 	};
 
-	// ---------------- Video Call Controls ----------------
+	// ---------------- Video Controls ----------------
 	const startVideo = async () => {
 		if (callActive) return;
-		initializePeerConnection();
-
 		if (!navigator.mediaDevices?.getUserMedia) {
-			alert("Camera/microphone not supported. Use Chrome, Edge, or Safari over HTTPS.");
+			alert("Camera/microphone not supported.");
 			return;
 		}
-
 		try {
 			const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-			if (localVideoRef.current) localVideoRef.current.srcObject = stream;
-			stream.getTracks().forEach((track) => pc.current.addTrack(track, stream));
+			localVideoRef.current.srcObject = stream;
+			if (!pc.current) initializePeerConnection();
+			addLocalTracks();
 			setCallActive(true);
 		} catch (err) {
 			console.error("Cannot access camera/microphone:", err);
-			alert("Please allow camera/microphone permissions.");
+			alert("Allow camera/microphone permissions.");
 		}
 	};
 
@@ -144,10 +145,9 @@ export default function VideoCallPage() {
 		if (!callActive) return;
 		if (notifyRemote && remoteIdRef.current) socket.current.emit("end-call", { to: remoteIdRef.current });
 
-		localVideoRef.current?.srcObject?.getTracks().forEach((track) => track.stop());
+		localVideoRef.current?.srcObject?.getTracks().forEach((t) => t.stop());
 		localVideoRef.current.srcObject = null;
-
-		remoteVideoRef.current?.srcObject?.getTracks().forEach((track) => track.stop());
+		remoteVideoRef.current?.srcObject?.getTracks().forEach((t) => t.stop());
 		remoteVideoRef.current.srcObject = null;
 
 		pc.current?.close();
@@ -159,42 +159,28 @@ export default function VideoCallPage() {
 	};
 
 	const toggleMute = () => {
-		const newMuted = !isMuted;
-		localVideoRef.current?.srcObject?.getAudioTracks().forEach((track) => (track.enabled = !newMuted));
-		setIsMuted(newMuted);
+		setIsMuted((prev) => {
+			localVideoRef.current?.srcObject?.getAudioTracks().forEach((t) => (t.enabled = prev));
+			return !prev;
+		});
 	};
 
 	const toggleCamera = () => {
-		const newCameraOn = !cameraOn;
-		localVideoRef.current?.srcObject?.getVideoTracks().forEach((track) => (track.enabled = newCameraOn));
-		setCameraOn(newCameraOn);
+		setCameraOn((prev) => {
+			localVideoRef.current?.srcObject?.getVideoTracks().forEach((t) => (t.enabled = !prev));
+			return !prev;
+		});
 	};
 
-	const copyText = (text) => navigator.clipboard.writeText(text);
-	const speakText = (text, lang) => {
-		speechSynthesis.cancel();
-		const utterance = new SpeechSynthesisUtterance(text);
-		utterance.lang = lang === "Filipino" ? "fil-PH" : "en-US";
-		speechSynthesis.speak(utterance);
-	};
-	const toggleChatLang = (index) => {
-		setTranslations((prev) =>
-			prev.map((item, i) => (i === index ? { ...item, showLang: item.showLang === "En" ? "Fil" : "En" } : item))
-		);
-	};
-
-	// ---------------- ASL Integration for both users ----------------
+	// ---------------- ASL Translation ----------------
 	const captureFrameBlob = (videoRef, scale = 1) => {
 		if (!videoRef.current) return null;
 		const video = videoRef.current;
 		const canvas = document.createElement("canvas");
 		canvas.width = video.videoWidth * scale;
 		canvas.height = video.videoHeight * scale;
-		const ctx = canvas.getContext("2d");
-		ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-		return new Promise((resolve) => {
-			canvas.toBlob((blob) => resolve(blob), "image/jpeg", 0.8);
-		});
+		canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+		return new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), "image/jpeg", 0.8));
 	};
 
 	const sendFrameToBackend = async (videoRef, setTranslation, sender = "local") => {
@@ -204,8 +190,8 @@ export default function VideoCallPage() {
 		formData.append("file", blob, "frame.jpg");
 
 		try {
-			const response = await fetch(ASL_BACKEND_URL, { method: "POST", body: formData });
-			const data = await response.json();
+			const res = await fetch(ASL_BACKEND_URL, { method: "POST", body: formData });
+			const data = await res.json();
 			if (data.prediction) {
 				setTranslation(data.prediction);
 				setTranslations((prev) => [
@@ -214,7 +200,7 @@ export default function VideoCallPage() {
 						textEn: data.prediction,
 						textFil: data.prediction,
 						timestamp: new Date().toLocaleTimeString(),
-						sender: sender,
+						sender,
 						showLang: "En",
 						accuracy: "N/A",
 					},
@@ -240,12 +226,26 @@ export default function VideoCallPage() {
 		};
 	}, [callActive]);
 
+	const toggleChatLang = (index) => {
+		setTranslations((prev) =>
+			prev.map((item, i) => (i === index ? { ...item, showLang: item.showLang === "En" ? "Fil" : "En" } : item))
+		);
+	};
+
+	const copyText = (text) => navigator.clipboard.writeText(text);
+	const speakText = (text, lang) => {
+		speechSynthesis.cancel();
+		const u = new SpeechSynthesisUtterance(text);
+		u.lang = lang === "Filipino" ? "fil-PH" : "en-US";
+		speechSynthesis.speak(u);
+	};
+
 	// ---------------- JSX ----------------
 	return (
 		<div className="flex h-screen bg-gray-100 text-gray-900">
 			<main className="flex-1 flex flex-col items-center justify-center p-6 gap-6">
 				<div className="flex gap-6 w-full justify-center flex-wrap relative">
-					{/* Local Video */}
+					{/* Local */}
 					<div className="relative">
 						<video
 							ref={localVideoRef}
@@ -268,8 +268,7 @@ export default function VideoCallPage() {
 							)}
 						</div>
 					</div>
-
-					{/* Remote Video */}
+					{/* Remote */}
 					<div className="relative">
 						<video
 							ref={remoteVideoRef}
@@ -289,33 +288,33 @@ export default function VideoCallPage() {
 				<div className="flex gap-6">
 					<button
 						onClick={toggleMute}
-						className={`flex items-center gap-2 px-5 py-3 rounded-full shadow-lg text-white transition-transform hover:scale-105 ${
+						className={`flex items-center gap-2 px-5 py-3 rounded-full ${
 							isMuted ? "bg-gray-500" : "bg-red-500"
-						}`}
+						} text-white`}
 					>
-						{isMuted ? <FaMicrophoneSlash /> : <FaMicrophone />} <span>{isMuted ? "Unmute" : "Mute"}</span>
+						{isMuted ? <FaMicrophoneSlash /> : <FaMicrophone />} {isMuted ? "Unmute" : "Mute"}
 					</button>
 					<button
 						onClick={toggleCamera}
-						className={`flex items-center gap-2 px-5 py-3 rounded-full shadow-lg text-white transition-transform hover:scale-105 ${
+						className={`flex items-center gap-2 px-5 py-3 rounded-full ${
 							cameraOn ? "bg-blue-500" : "bg-gray-500"
-						}`}
+						} text-white`}
 					>
-						{cameraOn ? <FaVideo /> : <FaVideoSlash />} <span>{cameraOn ? "Camera On" : "Camera Off"}</span>
+						{cameraOn ? <FaVideo /> : <FaVideoSlash />} {cameraOn ? "Camera On" : "Camera Off"}
 					</button>
 					{!callActive ? (
 						<button
 							onClick={startVideo}
-							className="flex items-center gap-2 px-5 py-3 rounded-full bg-green-500 shadow-lg text-white transition-transform hover:scale-105"
+							className="flex items-center gap-2 px-5 py-3 rounded-full bg-green-500 text-white"
 						>
-							<FaPhone /> <span>Start Call</span>
+							<FaPhone /> Start Call
 						</button>
 					) : (
 						<button
 							onClick={() => endCall()}
-							className="flex items-center gap-2 px-5 py-3 rounded-full bg-red-600 shadow-lg text-white transition-transform hover:scale-105"
+							className="flex items-center gap-2 px-5 py-3 rounded-full bg-red-600 text-white"
 						>
-							<FaPhoneSlash /> <span>End Call</span>
+							<FaPhoneSlash /> End Call
 						</button>
 					)}
 				</div>
@@ -335,21 +334,19 @@ export default function VideoCallPage() {
 				</div>
 			</main>
 
-			{/* Translation History Sidebar */}
+			{/* Translation History */}
 			<aside className="w-80 flex-shrink-0 bg-white shadow-lg p-4 overflow-y-auto border-l border-gray-200 flex flex-col">
 				<h2 className="text-lg font-semibold mb-4">Translation History</h2>
 				<div className="flex flex-col gap-3">
 					{translations.map((item, i) => {
-						const textToShow = item.showLang === "En" ? item.textEn : item.textFil;
-						const langLabel = item.showLang === "En" ? "English" : "Filipino";
+						const text = item.showLang === "En" ? item.textEn : item.textFil;
 						const alignment =
 							item.sender === "local"
 								? "self-end bg-blue-100 text-right"
 								: "self-start bg-green-100 text-left";
-
 						return (
 							<div key={i} className={`p-3 rounded-lg shadow-sm max-w-[85%] ${alignment}`}>
-								<p className="font-medium">{textToShow}</p>
+								<p className="font-medium">{text}</p>
 								<p className="text-xs text-gray-600">{item.timestamp}</p>
 								<p className="text-xs text-green-700">Accuracy: {item.accuracy}</p>
 								<div className="flex gap-2 mt-2 justify-end">
@@ -357,16 +354,16 @@ export default function VideoCallPage() {
 										onClick={() => toggleChatLang(i)}
 										className="px-2 py-1 text-xs bg-yellow-500 text-white rounded"
 									>
-										{langLabel} ↔ {item.showLang === "En" ? "Filipino" : "English"}
+										{item.showLang === "En" ? "Filipino" : "English"}
 									</button>
 									<button
-										onClick={() => copyText(textToShow)}
+										onClick={() => copyText(text)}
 										className="px-2 py-1 text-xs bg-blue-500 text-white rounded"
 									>
 										Copy
 									</button>
 									<button
-										onClick={() => speakText(textToShow, langLabel)}
+										onClick={() => speakText(text, item.showLang === "En" ? "English" : "Filipino")}
 										className="px-2 py-1 text-xs bg-gray-700 text-white rounded"
 									>
 										Speak
