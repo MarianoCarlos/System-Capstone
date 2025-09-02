@@ -26,34 +26,40 @@ export default function VideoCallPage() {
 	useEffect(() => {
 		socket.current = io(SOCKET_SERVER_URL);
 
-		socket.current.on("connect", () => socket.current.emit("join-room", "my-room"));
+		socket.current.on("connect", () => {
+			console.log("Connected to Socket.IO:", socket.current.id);
+			socket.current.emit("join-room", "my-room"); // you can make this dynamic
+		});
 
-		socket.current.on("new-user", async (id) => {
+		socket.current.on("new-user", (id) => {
 			remoteIdRef.current = id;
 			if (!pc.current) initializePeerConnection();
-			addLocalTracks();
-			await createOffer(id);
-			flushICEQueue(id);
+			if (localVideoRef.current?.srcObject) addLocalTracks();
+
+			// Flush queued ICE candidates
+			iceQueue.current.forEach((candidate) => socket.current.emit("ice-candidate", { candidate, to: id }));
+			iceQueue.current = [];
 		});
 
 		socket.current.on("offer", async ({ sdp, from }) => {
 			remoteIdRef.current = from;
-			if (!pc.current) initializePeerConnection();
-			addLocalTracks();
-			await handleOffer(new RTCSessionDescription(sdp), from); // fixed
+			await handleOffer(new RTCSessionDescription(sdp), from);
 		});
 
 		socket.current.on("answer", async ({ sdp }) => {
-			if (pc.current) await pc.current.setRemoteDescription(new RTCSessionDescription(sdp)); // fixed
+			if (pc.current) await pc.current.setRemoteDescription(new RTCSessionDescription(sdp));
 		});
 
 		socket.current.on("ice-candidate", async ({ candidate }) => {
-			if (candidate && pc.current) {
+			if (!candidate) return;
+			if (pc.current) {
 				try {
-					await pc.current.addIceCandidate(new RTCIceCandidate(candidate)); // fixed
+					await pc.current.addIceCandidate(new RTCIceCandidate(candidate));
 				} catch (err) {
 					console.error("Error adding ICE candidate:", err);
 				}
+			} else {
+				iceQueue.current.push(candidate);
 			}
 		});
 
@@ -67,26 +73,33 @@ export default function VideoCallPage() {
 
 	// ---------------- WebRTC ----------------
 	const initializePeerConnection = () => {
-		pc.current = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+		pc.current = new RTCPeerConnection({
+			iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+		});
 
 		pc.current.ontrack = (event) => {
 			if (remoteVideoRef.current) remoteVideoRef.current.srcObject = event.streams[0];
 		};
 
 		pc.current.onicecandidate = (event) => {
-			if (event.candidate) {
-				if (remoteIdRef.current) {
-					socket.current.emit("ice-candidate", { candidate: event.candidate, to: remoteIdRef.current });
-				} else {
-					iceQueue.current.push(event.candidate);
-				}
+			if (!event.candidate) return;
+			if (remoteIdRef.current) {
+				socket.current.emit("ice-candidate", { candidate: event.candidate, to: remoteIdRef.current });
+			} else {
+				iceQueue.current.push(event.candidate);
 			}
 		};
-	};
 
-	const flushICEQueue = (id) => {
-		iceQueue.current.forEach((candidate) => socket.current.emit("ice-candidate", { candidate, to: id }));
-		iceQueue.current = [];
+		pc.current.onnegotiationneeded = async () => {
+			if (!remoteIdRef.current) return;
+			try {
+				const offer = await pc.current.createOffer();
+				await pc.current.setLocalDescription(offer);
+				socket.current.emit("offer", { sdp: offer, to: remoteIdRef.current });
+			} catch (err) {
+				console.error("Negotiation error:", err);
+			}
+		};
 	};
 
 	const addLocalTracks = () => {
@@ -96,18 +109,6 @@ export default function VideoCallPage() {
 				pc.current.addTrack(track, localVideoRef.current.srcObject);
 			}
 		});
-	};
-
-	const createOffer = async (id) => {
-		if (!pc.current) return;
-		addLocalTracks();
-		try {
-			const offer = await pc.current.createOffer();
-			await pc.current.setLocalDescription(offer);
-			socket.current.emit("offer", { sdp: offer, to: id });
-		} catch (err) {
-			console.error("Error creating offer:", err);
-		}
 	};
 
 	const handleOffer = async (sdp, from) => {
@@ -154,6 +155,7 @@ export default function VideoCallPage() {
 		pc.current?.close();
 		pc.current = null;
 		remoteIdRef.current = null;
+
 		setLiveTranslationLocal("");
 		setLiveTranslationRemote("");
 		setCallActive(false);
@@ -161,7 +163,7 @@ export default function VideoCallPage() {
 
 	const toggleMute = () => {
 		setIsMuted((prev) => {
-			localVideoRef.current?.srcObject?.getAudioTracks().forEach((t) => (t.enabled = prev));
+			localVideoRef.current?.srcObject?.getAudioTracks().forEach((t) => (t.enabled = !prev));
 			return !prev;
 		});
 	};
@@ -175,7 +177,7 @@ export default function VideoCallPage() {
 
 	// ---------------- ASL Translation ----------------
 	const captureFrameBlob = (videoRef, scale = 1) => {
-		if (!videoRef.current) return null;
+		if (!videoRef.current || videoRef.current.readyState < 2) return null;
 		const video = videoRef.current;
 		const canvas = document.createElement("canvas");
 		canvas.width = video.videoWidth * scale;
@@ -196,7 +198,7 @@ export default function VideoCallPage() {
 			if (data.prediction) {
 				setTranslation(data.prediction);
 				setTranslations((prev) => [
-					...prev,
+					...prev.slice(-49),
 					{
 						textEn: data.prediction,
 						textFil: data.prediction,
@@ -245,8 +247,9 @@ export default function VideoCallPage() {
 	return (
 		<div className="flex h-screen bg-gray-100 text-gray-900">
 			<main className="flex-1 flex flex-col items-center justify-center p-6 gap-6">
+				{/* Video section */}
 				<div className="flex gap-6 w-full justify-center flex-wrap relative">
-					{/* Local */}
+					{/* Local Video */}
 					<div className="relative">
 						<video
 							ref={localVideoRef}
@@ -269,7 +272,8 @@ export default function VideoCallPage() {
 							)}
 						</div>
 					</div>
-					{/* Remote */}
+
+					{/* Remote Video */}
 					<div className="relative">
 						<video
 							ref={remoteVideoRef}
@@ -321,7 +325,7 @@ export default function VideoCallPage() {
 				</div>
 
 				{/* Live Translations */}
-				<div className="w-full max-w-4xl bg-white rounded-xl shadow p-4">
+				<div className="w-full max-w-4xl bg-white rounded-xl shadow p-4 mt-4">
 					<h3 className="text-md font-semibold">Your Translation</h3>
 					<div className="h-24 bg-gray-50 p-3 rounded-md border overflow-y-auto">
 						<p className="text-gray-700">{liveTranslationLocal || "Your signing translation..."}</p>
