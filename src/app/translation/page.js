@@ -40,17 +40,17 @@ export default function VideoCallPage() {
 			remoteIdRef.current = from;
 			if (!pc.current) initializePeerConnection();
 			addLocalTracks();
-			await handleOffer(sdp, from);
+			await handleOffer(new RTCSessionDescription(sdp), from); // fixed
 		});
 
 		socket.current.on("answer", async ({ sdp }) => {
-			if (pc.current) await pc.current.setRemoteDescription(sdp);
+			if (pc.current) await pc.current.setRemoteDescription(new RTCSessionDescription(sdp)); // fixed
 		});
 
 		socket.current.on("ice-candidate", async ({ candidate }) => {
 			if (candidate && pc.current) {
 				try {
-					await pc.current.addIceCandidate(candidate);
+					await pc.current.addIceCandidate(new RTCIceCandidate(candidate)); // fixed
 				} catch (err) {
 					console.error("Error adding ICE candidate:", err);
 				}
@@ -100,6 +100,7 @@ export default function VideoCallPage() {
 
 	const createOffer = async (id) => {
 		if (!pc.current) return;
+		addLocalTracks();
 		try {
 			const offer = await pc.current.createOffer();
 			await pc.current.setLocalDescription(offer);
