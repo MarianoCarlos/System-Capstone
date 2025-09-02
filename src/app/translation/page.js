@@ -4,6 +4,7 @@ import io from "socket.io-client";
 import { FaMicrophone, FaMicrophoneSlash, FaVideo, FaVideoSlash, FaPhone, FaPhoneSlash } from "react-icons/fa";
 
 const SOCKET_SERVER_URL = "https://backend-capstone-l19p.onrender.com";
+const ASL_BACKEND_URL = "https://backend-web-service-5f90.onrender.com/predict";
 
 export default function VideoCallPage() {
 	const localVideoRef = useRef(null);
@@ -16,7 +17,9 @@ export default function VideoCallPage() {
 	const [isMuted, setIsMuted] = useState(false);
 	const [cameraOn, setCameraOn] = useState(true);
 	const [callActive, setCallActive] = useState(false);
-	const [liveTranslation, setLiveTranslation] = useState("");
+
+	const [liveTranslationLocal, setLiveTranslationLocal] = useState("");
+	const [liveTranslationRemote, setLiveTranslationRemote] = useState("");
 	const [translations, setTranslations] = useState([]);
 
 	// ---------------- Socket.IO Setup ----------------
@@ -71,7 +74,6 @@ export default function VideoCallPage() {
 
 		pc.current.onicecandidate = (event) => {
 			if (!event.candidate) return;
-
 			if (remoteIdRef.current && pc.current.remoteDescription) {
 				socket.current.emit("ice-candidate", { candidate: event.candidate, to: remoteIdRef.current });
 			} else {
@@ -92,8 +94,6 @@ export default function VideoCallPage() {
 			const offer = await pc.current.createOffer();
 			await pc.current.setLocalDescription(offer);
 			socket.current.emit("offer", { sdp: offer, to: id });
-
-			// Small delay to ensure remote peer is ready
 			setTimeout(() => sendQueuedICE(id), 100);
 		} catch (err) {
 			console.error("Error creating offer:", err);
@@ -102,8 +102,6 @@ export default function VideoCallPage() {
 
 	const handleOffer = async (sdp, from) => {
 		if (!pc.current) initializePeerConnection();
-
-		// Add local tracks only if not already added
 		const localTracks = localVideoRef.current?.srcObject?.getTracks() || [];
 		localTracks.forEach((track) => {
 			const alreadyAdded = pc.current.getSenders().some((sender) => sender.track === track);
@@ -144,7 +142,6 @@ export default function VideoCallPage() {
 
 	const endCall = (notifyRemote = true) => {
 		if (!callActive) return;
-
 		if (notifyRemote && remoteIdRef.current) socket.current.emit("end-call", { to: remoteIdRef.current });
 
 		localVideoRef.current?.srcObject?.getTracks().forEach((track) => track.stop());
@@ -156,7 +153,8 @@ export default function VideoCallPage() {
 		pc.current?.close();
 		pc.current = null;
 		remoteIdRef.current = null;
-		setLiveTranslation("");
+		setLiveTranslationLocal("");
+		setLiveTranslationRemote("");
 		setCallActive(false);
 	};
 
@@ -179,17 +177,72 @@ export default function VideoCallPage() {
 		utterance.lang = lang === "Filipino" ? "fil-PH" : "en-US";
 		speechSynthesis.speak(utterance);
 	};
-
 	const toggleChatLang = (index) => {
 		setTranslations((prev) =>
 			prev.map((item, i) => (i === index ? { ...item, showLang: item.showLang === "En" ? "Fil" : "En" } : item))
 		);
 	};
 
+	// ---------------- ASL Integration for both users ----------------
+	const captureFrameBlob = (videoRef, scale = 1) => {
+		if (!videoRef.current) return null;
+		const video = videoRef.current;
+		const canvas = document.createElement("canvas");
+		canvas.width = video.videoWidth * scale;
+		canvas.height = video.videoHeight * scale;
+		const ctx = canvas.getContext("2d");
+		ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+		return new Promise((resolve) => {
+			canvas.toBlob((blob) => resolve(blob), "image/jpeg", 0.8);
+		});
+	};
+
+	const sendFrameToBackend = async (videoRef, setTranslation, sender = "local") => {
+		const blob = await captureFrameBlob(videoRef, sender === "remote" ? 0.3 : 1);
+		if (!blob) return;
+		const formData = new FormData();
+		formData.append("file", blob, "frame.jpg");
+
+		try {
+			const response = await fetch(ASL_BACKEND_URL, { method: "POST", body: formData });
+			const data = await response.json();
+			if (data.prediction) {
+				setTranslation(data.prediction);
+				setTranslations((prev) => [
+					...prev,
+					{
+						textEn: data.prediction,
+						textFil: data.prediction,
+						timestamp: new Date().toLocaleTimeString(),
+						sender: sender,
+						showLang: "En",
+						accuracy: "N/A",
+					},
+				]);
+			}
+		} catch (err) {
+			console.error(`${sender} ASL prediction error:`, err);
+		}
+	};
+
+	useEffect(() => {
+		let localInterval, remoteInterval;
+		if (callActive) {
+			localInterval = setInterval(() => sendFrameToBackend(localVideoRef, setLiveTranslationLocal, "local"), 500);
+			remoteInterval = setInterval(
+				() => sendFrameToBackend(remoteVideoRef, setLiveTranslationRemote, "remote"),
+				1000
+			);
+		}
+		return () => {
+			clearInterval(localInterval);
+			clearInterval(remoteInterval);
+		};
+	}, [callActive]);
+
 	// ---------------- JSX ----------------
 	return (
 		<div className="flex h-screen bg-gray-100 text-gray-900">
-			{/* Main Video Area */}
 			<main className="flex-1 flex flex-col items-center justify-center p-6 gap-6">
 				<div className="flex gap-6 w-full justify-center flex-wrap relative">
 					{/* Local Video */}
@@ -250,7 +303,6 @@ export default function VideoCallPage() {
 					>
 						{cameraOn ? <FaVideo /> : <FaVideoSlash />} <span>{cameraOn ? "Camera On" : "Camera Off"}</span>
 					</button>
-
 					{!callActive ? (
 						<button
 							onClick={startVideo}
@@ -268,24 +320,22 @@ export default function VideoCallPage() {
 					)}
 				</div>
 
-				{/* Live Translation */}
+				{/* Live Translations */}
 				<div className="w-full max-w-4xl bg-white rounded-xl shadow p-4">
-					<div className="flex justify-between items-center mb-2">
-						<h3 className="text-md font-semibold">Live Translation</h3>
-						<button
-							onClick={() => setLiveTranslation("")}
-							className="px-3 py-1 text-xs bg-red-500 text-white rounded shadow hover:bg-red-600"
-						>
-							Clear
-						</button>
+					<h3 className="text-md font-semibold">Your Translation</h3>
+					<div className="h-24 bg-gray-50 p-3 rounded-md border overflow-y-auto">
+						<p className="text-gray-700">{liveTranslationLocal || "Your signing translation..."}</p>
 					</div>
-					<div className="h-28 bg-gray-50 p-3 rounded-md border overflow-y-auto">
-						<p className="text-gray-700">{liveTranslation || "Ongoing translation appears here..."}</p>
+				</div>
+				<div className="w-full max-w-4xl bg-white rounded-xl shadow p-4 mt-4">
+					<h3 className="text-md font-semibold">Remote Translation</h3>
+					<div className="h-24 bg-gray-50 p-3 rounded-md border overflow-y-auto">
+						<p className="text-gray-700">{liveTranslationRemote || "Remote signing translation..."}</p>
 					</div>
 				</div>
 			</main>
 
-			{/* Translation History */}
+			{/* Translation History Sidebar */}
 			<aside className="w-80 flex-shrink-0 bg-white shadow-lg p-4 overflow-y-auto border-l border-gray-200 flex flex-col">
 				<h2 className="text-lg font-semibold mb-4">Translation History</h2>
 				<div className="flex flex-col gap-3">
